@@ -1,0 +1,249 @@
+# -*- coding: utf-8 -*-
+#
+# Copyright (C) 2016-2017 Bitergia
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335, USA.
+#
+# Authors:
+#     Alvaro del Castillo <acs@bitergia.com>
+#
+
+import json
+import logging
+
+import requests
+
+from datetime import datetime
+
+from ...backend import (Backend,
+                        BackendCommand,
+                        BackendCommandArgumentParser,
+                        metadata)
+from ...errors import CacheError
+from ...utils import (str_to_datetime)
+
+
+logger = logging.getLogger(__name__)
+
+OPENFDA_DEFAULT_DATE = '2004-01-01'  # First date with data for drugs events
+
+
+class OpenFDA(Backend):
+    """OpenFDA backend for Perceval.
+
+    This class retrieves the events from OpenFDA drug events.
+    Documentation available at https://open.fda.gov/drug/event/
+
+    :param tag: label used to mark the data
+    :param cache: cache object to store raw data
+    """
+    version = '0.5.0'
+
+    def __init__(self, url=None, tag=None, cache=None):
+        if not url:
+            url = OpenFDAClient.OPENFDA_API_URL
+        origin = url
+
+        super().__init__(origin, tag=tag, cache=cache)
+        self.url = url
+        self.client = OpenFDAClient()
+        self.__users = {}  # internal users cache
+
+    @metadata
+    def fetch(self, from_date=OPENFDA_DEFAULT_DATE):
+        """Fetch items from the OpenFDA url.
+
+        The method retrieves, from a OpenFDA URL, the set of items
+        of the given `category`.
+
+        :from_date: obtain items after from_date
+        :returns: a generator of items
+        """
+        logger.info("Looking for drug events at url '%s' from %s date",
+                    self.url, from_date)
+
+        nitems = 0  # number of items processed
+        titems = 0  # number of items from API data
+
+        self._purge_cache_queue()
+
+        for raw_items in self.client.get_items(from_date):
+            self._push_cache_queue(raw_items)
+            items_data = json.loads(raw_items)
+            if 'meta' not in items_data:
+                logger.info("No items found in client results.")
+                break
+            titems = items_data['meta']['results']['total']
+            skip = items_data['meta']['results']['skip']
+            logger.info("Pending items to retrieve: %i", titems - skip)
+            if titems - skip > OpenFDAClient.MAX_SKIP:
+                logging.warning("Only %i will be collected", OpenFDAClient.MAX_SKIP)
+            items = items_data['results']
+            for item in items:
+                yield item
+                nitems += 1
+                self._flush_cache_queue()
+
+        logger.info("Total number of events: %i (%i total)", nitems, titems)
+
+    @metadata
+    def fetch_from_cache(self):
+        """Fetch the items from the cache.
+
+        :returns: a generator of items
+
+        :raises CacheError: raised when an error occurs accessing the
+            cache
+        """
+        logger.info("Retrieving cached OpenFDA items: '%s'", self.url)
+
+        if not self.cache:
+            raise CacheError(cause="cache instance was not provided")
+
+        cache_items = self.cache.retrieve()
+
+        nitems = 0
+
+        for raw_items in cache_items:
+            items_data = json.loads(raw_items)
+            for item in items_data:
+                yield item
+                nitems += 1
+
+        logger.info("Retrieval process completed: %s items retrieved from cache",
+                    nitems)
+
+    @classmethod
+    def has_caching(cls):
+        """Returns whether it supports caching items on the fetch process.
+
+        :returns: this backend supports items cache
+        """
+        return True
+
+    @classmethod
+    def has_resuming(cls):
+        """Returns whether it supports to resume the fetch process.
+
+        :returns: this backend supports items resuming
+        """
+        return True
+
+    @staticmethod
+    def metadata_id(item):
+        """Extracts the identifier from a OpenFDA item."""
+        return str(item['safetyreportid'])
+
+    @staticmethod
+    def metadata_updated_on(item):
+        """Extracts the update time from a OpenFDA item.
+
+        The timestamp is extracted from 'end' field.
+        This date is converted to a perceval format using a float value.
+
+        :param item: item generated by the backend
+
+        :returns: a UNIX timestamp
+        """
+        updated = item['receiptdate']
+
+        return float(str_to_datetime(updated).timestamp())
+
+    @staticmethod
+    def metadata_category(item):
+        """Extracts the category from a OpenFDA item.
+        """
+        category = 'event'
+
+        return category
+
+
+class OpenFDAClient:
+    """OpenFDA API client.
+
+    This class implements a simple client to retrieve events from
+    projects in a OpenFDA site.
+
+    If the total number of items is higher than MAX_SKIP
+    we can not paginate through all of them.
+
+    :raises HTTPError: when an error occurs doing the request
+    """
+
+    ITEMS_PER_PAGE = 100 # Max items per page in OpenFDA API
+    MAX_SKIP = 5000  # Max skip suppported in OpenFDA API
+    OPENFDA_API_URL = "https://api.fda.gov/drug/event.json"
+
+    def __init__(self):
+        self.url = self.OPENFDA_API_URL
+
+    def call(self, params=None):
+        """Run an API command.
+        :param params: dict with the HTTP parameters needed to run
+            the given command
+        """
+        logger.debug("OpenFDA client calls: %s params: %s", self.url, str(params))
+
+        req = requests.get(self.url, params=params)
+        try:
+            req.raise_for_status()
+        except requests.exceptions.HTTPError:
+            if req.status_code == 404:
+                logger.warning("No results found")
+            else:
+                raise
+
+        return req.text
+
+    def get_items(self, from_date=None):
+        """Retrieve all items using pagination """
+
+        skip = 0
+
+        while True:
+            params = "skip=%i&limit=%i" % (skip, self.ITEMS_PER_PAGE)
+
+            if from_date:
+                start = from_date.strftime("%Y%m%d")
+                end = datetime.now().strftime("%Y%m%d")
+                params += "&search=receivedate:[%s+TO+%s]" % (start, end)
+
+            raw_items = self.call(params)
+            yield raw_items
+
+            items_data = json.loads(raw_items)
+            if len(items_data) == 0:
+                break
+
+            skip += self.ITEMS_PER_PAGE
+
+            if skip >= self.MAX_SKIP:
+                logging.error("Can not skip more than %i items", self.MAX_SKIP)
+                break
+
+
+class OpenFDACommand(BackendCommand):
+    """Class to run OpenFDA backend from the command line."""
+
+    BACKEND = OpenFDA
+
+    @staticmethod
+    def setup_cmd_parser():
+        """Returns the OpenFDA argument parser."""
+
+        parser = BackendCommandArgumentParser(from_date=True,
+                                              token_auth=True,
+                                              cache=True)
+        return parser
